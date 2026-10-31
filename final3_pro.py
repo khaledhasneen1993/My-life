@@ -592,7 +592,14 @@ async def main():
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    import fcntl
+    state_path = STATE_FILE.resolve()
+    with state_path.with_name(state_path.name + ".lock").open("a") as state_lock:
+        try:
+            fcntl.flock(state_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit("My-life is already running on this state file")
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            pass
