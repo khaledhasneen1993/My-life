@@ -1,6 +1,6 @@
 # language: Python 3.11+
 # file: final3_pro.py
-# Final-3 Pro — Single File | Dynamic size + light MTF + 7% SL + 1 scale-in
+# Final-3 Pro — Single File | Dynamic size + MTF + post-add protection
 
 import asyncio
 import json
@@ -32,6 +32,9 @@ MAX_PRICE_AGE = 12.0
 TICKER_TIMEOUT = 8.0
 EXIT_INTERVAL = 8.0
 TRAIL_DISTANCE = 0.009
+POST_ADD_STOP_PCT = 0.04
+PARTIAL_ADVERSE_PCT = 0.03
+PARTIAL_CLOSE_FRACTION = 0.50
 STATE_FILE = Path("paper_state_final3_pro.json")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -97,22 +100,36 @@ class PaperAccount:
 
         if closing:
             pos = self.positions.get(symbol)
-            if (not pos or side == pos["side"]
-                    or not math.isclose(amount, pos["amount"], rel_tol=1e-9)):
-                raise ValueError("Invalid full-position close")
+            if not pos or side == pos["side"] or amount > pos["amount"]:
+                raise ValueError("Invalid reduce-only amount or direction")
+            full_close = amount == pos["amount"]
             direction = 1 if pos["side"] == "buy" else -1
             pnl = (price - pos["entry"]) * amount * direction
+            released_margin = pos["margin"] * amount / pos["amount"]
+            fees_paid = pos.get("fees_paid", pos["entry"] * pos["amount"] * self.fee_rate) + fee
+            realized_pnl = pos.get("realized_pnl", 0.0) + pnl
             self.prices[symbol] = price
             self.balance += pnl - fee
-            del self.positions[symbol]
+            if full_close:
+                del self.positions[symbol]
+            else:
+                self.positions[symbol] = {
+                    **pos, "amount": pos["amount"] - amount,
+                    "margin": pos["margin"] - released_margin,
+                    "fees_paid": fees_paid, "realized_pnl": realized_pnl,
+                }
             trade = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "symbol": symbol, "side": side, "amount": amount,
                 "price": price, "pnl_usdt": pnl, "fee_usdt": fee,
-                "reduceOnly": True,
+                "reduceOnly": True, "partial_close": not full_close,
+                "remaining_amount": 0.0 if full_close else self.positions[symbol]["amount"],
+                "released_margin_usdt": released_margin,
                 "exit_reason": params.get("exit_reason"),
-                "market_timestamp": ticker["timestamp"]
+                "market_timestamp": ticker["timestamp"],
             }
+            if full_close:
+                trade["position_net_pnl_usdt"] = realized_pnl - fees_paid
             self.trades.append(trade)
             return trade
 
@@ -140,6 +157,8 @@ class PaperAccount:
                 "margin": old["margin"] + margin,
                 "original_entry": old.get("original_entry", old["entry"]),
                 "original_notional": old.get("original_notional", old["entry"] * old["amount"]),
+                "fees_paid": old.get("fees_paid", old["entry"] * old["amount"] * self.fee_rate) + fee,
+                "realized_pnl": old.get("realized_pnl", 0.0),
             }
         else:
             self.positions[symbol] = {
@@ -149,6 +168,7 @@ class PaperAccount:
                 "margin": margin,
                 "original_entry": price,
                 "original_notional": notional,
+                "fees_paid": fee, "realized_pnl": 0.0,
             }
 
         trade = {
@@ -196,6 +216,14 @@ class Final3Pro:
                     pos.setdefault("adds_done", 0)
                     pos.setdefault("trailing", False)
                     pos.setdefault("best_price", pos["entry"])
+                    pos.setdefault("partial_done", False)
+                    pos.setdefault("break_even_armed", False)
+                    pos.setdefault("stop_kind", "TRAIL_SL" if pos["trailing"] else "SL")
+                    # Older states had no partial exits; their entry fees are recoverable.
+                    fill.setdefault("fees_paid", fill["entry"] * fill["amount"] * self.account.fee_rate)
+                    fill.setdefault("realized_pnl", 0.0)
+                    if pos["adds_done"]:
+                        self.apply_tight_stop(pos)
                 log.info(f"State loaded | balance={self.account.balance:.2f}")
             except Exception as e:
                 raise RuntimeError(f"State load failed; original file preserved: {e}") from e
@@ -328,7 +356,10 @@ class Final3Pro:
                 "trailing": False,
                 "best_price": fill_price,
                 "strength": strength,
-                "margin_pct": margin_pct
+                "margin_pct": margin_pct,
+                "partial_done": False,
+                "break_even_armed": False,
+                "stop_kind": "SL"
             }
             log.info(f"ENTER {side.upper()} {symbol} | size={amount:.4f} @ {fill_price:.4f} | strength={strength:.3f} | margin={margin_pct*100:.1f}%")
             self.save_state()
@@ -361,11 +392,63 @@ class Final3Pro:
             fill = self.account.positions[symbol]
             p.update(entry=fill["entry"], amount=fill["amount"], adds_done=1)
             p["tp"] = p["entry"] * (1 + direction * TAKE_PROFIT_PCT)
+            self.apply_tight_stop(p)
+            self.account.trades[-1]["stop_loss_price"] = p["sl"]
             log.info("SCALE-IN %s | new avg=%.4f", symbol, p["entry"])
             self.save_state()
             return True
         except Exception as e:
             log.warning("Scale-in failed %s: %s", symbol, e)
+            return False
+
+    @staticmethod
+    def tighten_stop(p, candidate, kind):
+        improves = candidate > p["sl"] if p["side"] == "buy" else candidate < p["sl"]
+        if improves:
+            p["sl"] = candidate
+            p["stop_kind"] = kind
+
+    def apply_tight_stop(self, p):
+        direction = 1 if p["side"] == "buy" else -1
+        self.tighten_stop(p, p["entry"] * (1 - direction * POST_ADD_STOP_PCT), "TIGHT_SL")
+
+    def break_even_price(self, symbol):
+        # Cover all lifecycle fees and realized partial losses with the remaining quantity.
+        fill = self.account.positions[symbol]
+        direction = 1 if fill["side"] == "buy" else -1
+        amount = fill["amount"]
+        fees = fill["fees_paid"]
+        realized = fill["realized_pnl"]
+        return (direction * fill["entry"] * amount + fees - realized) / (
+            amount * (direction - self.account.fee_rate))
+
+    async def partial_close(self, symbol, *, ticker):
+        try:
+            p = self.positions[symbol]
+            if p.get("partial_done") or not p["adds_done"]:
+                return False
+            price = validated_price(ticker)
+            direction = 1 if p["side"] == "buy" else -1
+            if direction * (price - p["sl"]) <= 0:
+                return False
+            adverse = -direction * (price / p["entry"] - 1)
+            if adverse + 1e-12 < PARTIAL_ADVERSE_PCT:
+                return False
+            amount = float(self.exchange.amount_to_precision(symbol, p["amount"] * PARTIAL_CLOSE_FRACTION))
+            if amount <= 0 or amount >= p["amount"]:
+                log.warning("Partial close skipped %s: quantity too small to split", symbol)
+                return False
+            side = "sell" if p["side"] == "buy" else "buy"
+            await self.account.create_order(
+                symbol, "market", side, amount,
+                params={"reduceOnly": True, "exit_reason": "PARTIAL_RISK"}, ticker=ticker)
+            p["amount"] = self.account.positions[symbol]["amount"]
+            p["partial_done"] = True
+            self.save_state()
+            log.info("PARTIAL_RISK %s | closed=%.8f remaining=%.8f", symbol, amount, p["amount"])
+            return True
+        except Exception as e:
+            log.warning("Partial close failed %s: %s", symbol, e)
             return False
 
     async def manage_position(self, symbol):
@@ -378,12 +461,25 @@ class Final3Pro:
                 price = validated_price(ticker)
                 p = self.positions[symbol]
                 direction = 1 if p["side"] == "buy" else -1
+                if p["adds_done"]:
+                    self.apply_tight_stop(p)
                 if direction * (price - p["sl"]) <= 0:
-                    await self.close(symbol, "TRAIL_SL" if p["trailing"] else "SL", price, ticker=ticker)
+                    await self.close(symbol, p.get("stop_kind", "SL"), price, ticker=ticker)
                     return
                 adverse = -direction * (price / p["original_entry"] - 1)
                 if not p["trailing"] and p["adds_done"] == 0 and adverse + 1e-12 >= ADD_LEVEL:
                     await self.add_position(symbol, price, ticker=ticker)
+                # A gap can already be beyond the newly tightened stop; close all first.
+                if direction * (price - p["sl"]) <= 0:
+                    await self.close(symbol, p.get("stop_kind", "SL"), price, ticker=ticker)
+                    return
+                if p["adds_done"]:
+                    await self.partial_close(symbol, ticker=ticker)
+                    break_even = self.break_even_price(symbol)
+                    p["break_even_price"] = break_even
+                    if math.isfinite(break_even) and direction * (price - break_even) > 1e-12:
+                        self.tighten_stop(p, break_even, "BE_SL")
+                        p["break_even_armed"] = True
                 gain = direction * (price / p["entry"] - 1)
                 if not p["trailing"] and gain + 1e-12 >= TAKE_PROFIT_PCT:
                     p["trailing"] = True
@@ -391,10 +487,9 @@ class Final3Pro:
                 if p["trailing"]:
                     if direction == 1:
                         p["best_price"] = max(p["best_price"], price)
-                        p["sl"] = max(p["sl"], p["best_price"] * (1 - TRAIL_DISTANCE))
                     else:
                         p["best_price"] = min(p["best_price"], price)
-                        p["sl"] = min(p["sl"], p["best_price"] * (1 + TRAIL_DISTANCE))
+                    self.tighten_stop(p, p["best_price"] * (1 - direction * TRAIL_DISTANCE), "TRAIL_SL")
                 self.save_state()
         except Exception as e:
             log.warning("Manage error %s: %s", symbol, e)
@@ -472,7 +567,7 @@ class Final3Pro:
             await asyncio.sleep(SCAN_INTERVAL)
 
     async def run(self):
-        log.info("Final-3 Pro started | 7% SL | dynamic size 10-17% | light MTF")
+        log.info("Final-3 Pro started | 7% SL -> 4% post-add -> break-even | 50% partial at 3% | dynamic size 10-17% | light MTF")
         tasks = []
         try:
             await self.exchange.load_markets()
