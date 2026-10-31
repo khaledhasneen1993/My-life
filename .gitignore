@@ -1,6 +1,9 @@
 .venv/
 __pycache__/
 *.py[cod]
-paper_state_final3_pro.json
-paper_state_final3_pro.json.tmp
+.pytest_cache/
+.env
+.env.*
+paper_state_final3_pro*.json
+paper_state_final3_pro*.json.tmp
 *.log
