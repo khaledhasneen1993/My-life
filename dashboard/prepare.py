@@ -3,7 +3,7 @@ import fcntl
 import importlib.util
 import json
 import sys
-from paths import NAMES, SOURCES, STATE_PATHS, LABELS
+from paths import NAMES, SOURCES, STATE_PATHS, LABELS, save_selection
 
 
 def prepare():
@@ -35,6 +35,7 @@ def prepare():
             print(f'{LABELS[name]} account: {path}')
             print('  Resuming balance:', state.get('balance_usdt', state.get('balance', 100)),
                   '| fills available:', len(state.get('trades', [])), '| open positions:', len(state.get('account_positions', {})))
+    save_selection()
 
 
 if __name__ == '__main__':
