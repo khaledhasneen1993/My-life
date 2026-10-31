@@ -34,6 +34,7 @@ def snapshot_state(name, bot, settings, status, ticker_health):
             account_positions=account.positions, strategy_positions=bot.positions,
             prices=account.prices, trades=account.trades[-150:], settings=settings,
             fee_rate=account.fee_rate, last_trade=bot.last_trade)
+        state['scan_report'] = getattr(bot, 'scan_status', {})
         now = time.time()
         symbols = sorted(set(bot.positions) | set(ticker_health))
         health = [dict(symbol=s, age=now-ticker_health[s]['received'] if s in ticker_health else None,

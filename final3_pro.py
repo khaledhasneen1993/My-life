@@ -195,6 +195,9 @@ class Final3Pro:
         self.positions = {}
         self.last_trade = {}
         self.lock = asyncio.Lock()
+        self.scan_status = {"phase": "starting", "cycle": 0, "checks": {}}
+        self.scan_errors = {}
+        self.entry_outcomes = {}
         self.load_state()
 
     def load_state(self):
@@ -259,6 +262,7 @@ class Final3Pro:
             candidates.sort(key=lambda x: x[1], reverse=True)
             return [s for s, _ in candidates[:MAX_SYMBOLS]]
         except Exception as e:
+            self.scan_status["universe_error"] = f"{type(e).__name__}: {e}"
             log.error(f"Top symbols error: {e}")
             return ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT"]
 
@@ -268,8 +272,14 @@ class Final3Pro:
             bid = sum(x[1] for x in ob["bids"][:20])
             ask = sum(x[1] for x in ob["asks"][:20])
             return (bid - ask) / (bid + ask) if (bid + ask) > 0 else 0.0
-        except:
+        except Exception as e:
+            self.note_scan_error(symbol, "order_book", e)
             return 0.0
+
+    def note_scan_error(self, symbol, stage, error):
+        message = f"{type(error).__name__}: {error}"
+        self.scan_errors.setdefault(symbol, []).append({"stage": stage, "message": message})
+        log.warning("SCAN DATA ERROR %s | %s | %s", symbol, stage, message)
 
     async def detect(self, symbol):
         try:
@@ -285,7 +295,8 @@ class Final3Pro:
                 ohlcv5 = await self.exchange.fetch_ohlcv(symbol, "5m", limit=8)
                 df5 = pd.DataFrame(ohlcv5, columns=["ts", "o", "h", "l", "c", "v"])
                 mtf = (df5["c"].iloc[-1] - df5["c"].iloc[-3]) / df5["c"].iloc[-3]
-            except:
+            except Exception as e:
+                self.note_scan_error(symbol, "optional_5m", e)
                 mtf = 0.0
 
             long_sig = ret > CASCADE_THRESHOLD and vol_spike > VOLUME_SPIKE and imb > 0.35
@@ -304,6 +315,7 @@ class Final3Pro:
                 "symbol": symbol
             }
         except Exception as e:
+            self.note_scan_error(symbol, "candles_1m_or_detection", e)
             return None
 
     async def fresh_ticker(self, symbol):
@@ -331,14 +343,17 @@ class Final3Pro:
     async def enter(self, symbol, side, price, strength):
         now = time.time()
         if symbol in self.last_trade and now - self.last_trade[symbol] < COOLDOWN_SEC:
+            self.entry_outcomes[symbol] = "COOLDOWN"
             return False
         if symbol in self.positions or len(self.positions) >= MAX_POSITIONS:
+            self.entry_outcomes[symbol] = "ALREADY_OPEN_OR_POSITION_LIMIT"
             return False
 
         try:
             ticker = await self.fresh_ticker(symbol)
             amount, margin_pct, fill_price = await self.size_position(symbol, strength, ticker=ticker)
             if amount <= 0:
+                self.entry_outcomes[symbol] = "QUANTITY_ROUNDED_TO_ZERO"
                 return False
             await self.account.create_order(
                 symbol, "market", side, amount,
@@ -361,10 +376,12 @@ class Final3Pro:
                 "break_even_armed": False,
                 "stop_kind": "SL"
             }
+            self.entry_outcomes[symbol] = "OPENED"
             log.info(f"ENTER {side.upper()} {symbol} | size={amount:.4f} @ {fill_price:.4f} | strength={strength:.3f} | margin={margin_pct*100:.1f}%")
             self.save_state()
             return True
         except Exception as e:
+            self.entry_outcomes[symbol] = f"{type(e).__name__}: {e}"
             log.error(f"Enter failed {symbol}: {e}")
             return False
 
@@ -524,24 +541,66 @@ class Final3Pro:
             await asyncio.sleep(max(0.0, EXIT_INTERVAL - (time.monotonic() - started)))
 
     async def scan_cycle(self):
+        self.scan_status = {
+            "phase": "scanning", "cycle": self.scan_status.get("cycle", 0) + 1,
+            "started_at": time.time(), "finished_at": None, "next_scan_at": None,
+            "total": 0, "checked": 0, "successful": 0, "failed": 0,
+            "move_pass": 0, "volume_pass": 0, "book_pass": 0,
+            "signals": 0, "entries": 0, "entry_attempts": 0,
+            "entry_results": {}, "checks": {},
+        }
+        self.scan_errors = {}
+        self.entry_outcomes = {}
         symbols = await self.get_top_symbols()
+        self.scan_status["total"] = len(symbols)
         log.info(f"Scanning {len(symbols)} symbols...")
         signals = []
         for sym in symbols:
             sig = await self.detect(sym)
+            errors = self.scan_errors.get(sym, [])
+            failed = sig is None or any(e["stage"] != "optional_5m" for e in errors)
+            row = {"symbol": sym, "checked_at": time.time(),
+                   "status": "error" if failed else "checked", "errors": errors}
+            if sig is not None:
+                # Diagnostics do not alter the signal or its thresholds.
+                for key in ("ret", "vol_spike", "imb", "strength"):
+                    value = float(sig[key])
+                    row[key] = value if math.isfinite(value) else None
+                row["move_pass"] = bool(abs(sig["ret"]) > CASCADE_THRESHOLD)
+                row["volume_pass"] = bool(sig["vol_spike"] > VOLUME_SPIKE)
+                row["book_pass"] = bool((sig["ret"] > 0 and sig["imb"] > 0.35)
+                                         or (sig["ret"] < 0 and sig["imb"] < -0.35))
+                row["signal"] = "LONG" if sig["long"] else "SHORT" if sig["short"] else None
+                for key in ("move", "volume", "book"):
+                    self.scan_status[key + "_pass"] += int(row[key + "_pass"])
             if sig and (sig["long"] or sig["short"]):
                 signals.append(sig)
+            self.scan_status["checks"][sym] = row
+            self.scan_status["checked"] += 1
+            self.scan_status["failed" if failed else "successful"] += 1
+            self.scan_status["signals"] = len(signals)
             await asyncio.sleep(0.15)
 
         signals.sort(key=lambda x: x["strength"], reverse=True)
         for sig in signals:
             async with self.lock:
                 if len(self.positions) >= MAX_POSITIONS:
+                    self.scan_status["position_limit_reached"] = True
                     break
                 if sig["symbol"] in self.positions:
+                    self.scan_status["entry_results"][sig["symbol"]] = "ALREADY_OPEN"
                     continue
                 side = "buy" if sig["long"] else "sell"
-                await self.enter(sig["symbol"], side, sig["price"], sig["strength"])
+                self.scan_status["entry_attempts"] += 1
+                opened = await self.enter(sig["symbol"], side, sig["price"], sig["strength"])
+                self.scan_status["entries"] += int(bool(opened))
+                self.scan_status["entry_results"][sig["symbol"]] = self.entry_outcomes.get(
+                    sig["symbol"], "OPENED" if opened else "REJECTED")
+        self.scan_status["finished_at"] = time.time()
+        log.info("SCAN RESULT | checked=%d/%d ok=%d errors=%d move=%d volume=%d book=%d signals=%d opened=%d",
+                 self.scan_status["checked"], self.scan_status["total"], self.scan_status["successful"],
+                 self.scan_status["failed"], self.scan_status["move_pass"], self.scan_status["volume_pass"],
+                 self.scan_status["book_pass"], self.scan_status["signals"], self.scan_status["entries"])
 
     async def status_printer(self):
         while True:
@@ -562,7 +621,13 @@ class Final3Pro:
             try:
                 await self.scan_cycle()
             except Exception as e:
+                self.scan_status["phase"] = "error"
+                self.scan_status["cycle_error"] = f"{type(e).__name__}: {e}"
+                self.scan_status["finished_at"] = time.time()
                 log.error("Cycle error: %s", e)
+            else:
+                self.scan_status["phase"] = "waiting"
+            self.scan_status["next_scan_at"] = time.time() + SCAN_INTERVAL
             log.info("Next scan in %ss", SCAN_INTERVAL)
             await asyncio.sleep(SCAN_INTERVAL)
 

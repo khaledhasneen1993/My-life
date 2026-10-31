@@ -89,6 +89,14 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(s['trades'][-1]['extra'],'new');self.assertEqual(s['stats']['closed'],1)
         self.assertTrue(s['trades'][0]['dashboard_fill_id'])
 
+    async def test_scan_diagnostics_are_preserved_in_status(self):
+        report=dict(phase='waiting',checked=40,successful=39,failed=1,signals=0,
+                    entry_results={},checks={'BTC': {'status':'error','errors':[{'stage':'order_book','message':'timeout'}]}})
+        self.snapshot('mylife',scan_report=report)
+        response=await self.client.get('/api/status',headers=self.host)
+        payload=await response.json()
+        self.assertEqual(payload['bots']['mylife']['scan_report'],report)
+
     async def test_control_origin_host_and_token(self):
         response=await self.client.post('/api/mylife/stop',headers=self.host);self.assertEqual(response.status,403)
         headers={**self.host,'X-Control-Token':self.supervisor.token,'Origin':'https://other.example'}
