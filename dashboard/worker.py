@@ -22,6 +22,7 @@ def pro_settings(module):
         trail_activation=module.TAKE_PROFIT_PCT, trail_distance=module.TRAIL_DISTANCE,
         post_add_stop=module.POST_ADD_STOP_PCT, partial_adverse=module.PARTIAL_ADVERSE_PCT,
         partial_fraction=module.PARTIAL_CLOSE_FRACTION, max_price_age=module.MAX_PRICE_AGE,
+        watch_mode='continuous_websocket', universe_refresh=module.SCAN_INTERVAL,
         size_formula='0.10 + 0.07 * clamp((strength - 0.09) / 0.09, 0, 1)')
     return settings
 
@@ -34,19 +35,22 @@ def snapshot_state(name, bot, settings, status, ticker_health):
             account_positions=account.positions, strategy_positions=bot.positions,
             prices=account.prices, trades=account.trades[-150:], settings=settings,
             fee_rate=account.fee_rate, last_trade=bot.last_trade)
-        state['scan_report'] = getattr(bot, 'scan_status', {})
-        now = time.time()
-        symbols = sorted(set(bot.positions) | set(ticker_health))
-        health = [dict(symbol=s, age=now-ticker_health[s]['received'] if s in ticker_health else None,
-                       event_age=now-ticker_health[s]['market']/1000 if s in ticker_health else None,
-                       seeded=True) for s in symbols]
-        for h in health:
-            h['fresh'] = h['age'] is not None and h['age'] <= 12 and abs(h['event_age']) <= 12
-        state['scanner'] = dict(transport='rest', connected=None, symbols=symbols,
-            events=sum(h['events'] for h in ticker_health.values()), entries=None, book_checks=None,
+        sc = bot.scanner
+        state['scan_report'] = sc.diagnostics()
+        mono, wall = sc.clock(), sc.wall_clock()
+        health = []
+        for symbol in sc.symbols:
+            received, event = sc.received.get(symbol), sc.event_times.get(symbol)
+            age = mono-received if received is not None else None
+            event_age = wall-event/1000 if event is not None else None
+            health.append(dict(symbol=symbol, age=age, event_age=event_age,
+                fresh=bool(sc.connected and age is not None and age <= 10
+                           and event_age is not None and -10 <= event_age <= 10),
+                seeded=symbol in sc.histories))
+        state['scanner'] = dict(transport='websocket', connected=sc.connected,
+            symbols=list(sc.symbols), events=sc.events, entries=sc.entries, book_checks=sc.book_checks,
             last_event_age=min((h['age'] for h in health if h['age'] is not None), default=None),
-            fresh_symbols=sum(h['fresh'] for h in health), symbol_health=health,
-            freshness_limit=12)
+            fresh_symbols=sum(h['fresh'] for h in health), symbol_health=health, freshness_limit=10)
     else:
         account = bot.exchange
         state = dict(initial_balance_usdt=100.0, balance_usdt=account.balance,
@@ -119,15 +123,6 @@ async def run_worker(name):
         return fill
 
     account.create_order = archived_order
-    if name == 'mylife':
-        original_ticker = bot.fresh_ticker
-        async def observed_ticker(symbol):
-            ticker = await original_ticker(symbol)
-            health[symbol] = dict(received=time.time(), market=ticker['timestamp'],
-                                  events=health.get(symbol, {}).get('events', 0)+1)
-            return ticker
-        bot.fresh_ticker = observed_ticker
-
     def publish(status):
         sync_archive()
         state = snapshot_state(name, bot, settings, status, health)

@@ -102,13 +102,10 @@ class ScanTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Stale ticker',report['entry_results']['BTC/USDT:USDT'])
         self.assertFalse(self.bot.account.trades)
 
-    async def test_waiting_phase_and_next_scan_time(self):
-        async def stop_on_wait(seconds):
-            if seconds == pro.SCAN_INTERVAL:raise asyncio.CancelledError()
-        with patch.object(pro.asyncio, 'sleep', side_effect=stop_on_wait):
-            with self.assertRaises(asyncio.CancelledError):await self.bot.scan_loop()
-        self.assertEqual(self.bot.scan_status['phase'],'waiting')
-        self.assertGreater(self.bot.scan_status['next_scan_at'],time.time()+590)
+    async def test_live_loop_uses_continuous_scanner_without_600_second_pause(self):
+        with patch.object(self.bot.scanner, 'run', new=AsyncMock()) as run:
+            await self.bot.scan_loop()
+            run.assert_awaited_once()
 
 
 if __name__ == '__main__':unittest.main()
