@@ -6,6 +6,8 @@ python3 -c 'import sys; assert sys.version_info >= (3,11), "Python 3.11+ require
 python3 - <<'PY'
 import socket
 with socket.socket() as sock:
+    # Match aiohttp: allow a stopped listener's TCP TIME_WAIT sockets to expire.
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind(('127.0.0.1',8787))
     except OSError:
